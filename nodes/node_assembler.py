@@ -1,6 +1,24 @@
+"""
+nodes/node_assembler.py
+
+LangGraph Node 5: The Assembler.
+
+NO MODEL — FFmpeg only. Takes each beat's square image + narration
+audio (with its EXACT duration from Node 3) and:
+
+  1. Scales the square image up and center-crops it to 1080x1920
+     (never generates vertical directly — SDXL already gave us a
+     square, cropped here instead, per the face-distortion fix)
+  2. Applies a Ken Burns zoom effect, duration = that beat's exact
+     audio_duration (not a fixed guess) so motion and narration
+     stay in sync
+  3. Muxes the audio onto that beat's clip
+  4. Concatenates all beat clips into one video
+  5. Generates and burns subtitles matching each beat's timing
+"""
+
 import os
 import subprocess
-import uuid
 
 import config
 from state import PipelineState
@@ -8,9 +26,22 @@ from utils.logger_setup import log_event
 
 
 class AssemblyError(Exception):
+    """Raised when FFmpeg fails to produce the final rendered short."""
     pass
 
+
 def _run_ffmpeg(cmd: list[str], step_description: str, cwd: str = None) -> None:
+    """
+    Runs an FFmpeg command via subprocess, raising AssemblyError with
+    FFmpeg's actual stderr output on failure — this is the detail that
+    goes into logs/errors_*.log so a broken filter graph is debuggable
+    instead of a bare non-zero exit code.
+
+    cwd: optional working directory for the subprocess. Used by
+    _burn_subtitles to avoid passing an absolute Windows path (with
+    its drive-letter colon) into the -vf filter string at all — see
+    that function's docstring for why.
+    """
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
         raise AssemblyError(
@@ -20,6 +51,20 @@ def _run_ffmpeg(cmd: list[str], step_description: str, cwd: str = None) -> None:
 
 def _build_beat_clip(image_path: str, audio_path: str, duration: float,
                       output_path: str, fps: int = 30) -> None:
+    """
+    Turns one beat's square image + audio into a single vertical
+    video clip with a Ken Burns zoom, timed to the exact audio duration.
+
+    Filter graph:
+      1. scale=  -2:FINAL_VIDEO_HEIGHT   -> square scaled up so its
+         height covers the target vertical height (width follows,
+         staying square-proportioned before crop)
+      2. crop=FINAL_VIDEO_WIDTH:FINAL_VIDEO_HEIGHT (centered)
+         -> crops the now-oversized square down to the exact
+         1080x1920 target, discarding equal margins left/right
+      3. zoompan -> Ken Burns zoom, d (frame count) computed from
+         duration * fps so the effect exactly spans the narration
+    """
     total_frames = max(1, round(duration * fps))
 
     filter_complex = (
@@ -37,13 +82,15 @@ def _build_beat_clip(image_path: str, audio_path: str, duration: float,
         "-filter:v", filter_complex,
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-shortest",  
+        "-shortest",  # clip length follows the shorter stream (audio, since
+                      # zoompan frame count already matches audio duration)
         output_path,
     ]
     _run_ffmpeg(cmd, f"Ken Burns clip for {os.path.basename(image_path)}")
 
 
 def _write_concat_file(clip_paths: list[str], list_path: str) -> None:
+    """FFmpeg's concat demuxer needs a text file listing clips in order."""
     with open(list_path, "w") as f:
         for path in clip_paths:
             f.write(f"file '{path}'\n")
@@ -61,6 +108,10 @@ def _concat_clips(list_path: str, output_path: str) -> None:
 
 
 def _write_srt(beats: list[dict], srt_path: str) -> None:
+    """
+    Builds a subtitle file from each beat's text and exact duration,
+    with cumulative start/end timestamps across the whole video.
+    """
     def _format_ts(seconds: float) -> str:
         hrs = int(seconds // 3600)
         mins = int((seconds % 3600) // 60)
@@ -84,6 +135,26 @@ def _write_srt(beats: list[dict], srt_path: str) -> None:
 
 
 def _burn_subtitles(input_path: str, srt_path: str, output_path: str) -> None:
+    """
+    Burns subtitles onto the video using FFmpeg's subtitles filter.
+
+    IMPORTANT: does NOT pass an absolute path into the -vf filter
+    string. Two escaping strategies were tried and both failed on
+    this Windows/FFmpeg combination — backslash-escaping the drive
+    letter's colon (D\\:/...) and wrapping the whole path in single
+    quotes (filename='D:/...') — FFmpeg's filtergraph parser kept
+    losing track of the string partway through in both cases, with
+    the drive letter and closing quote vanishing from its own error
+    output. Rather than keep guessing at escape syntax, this sidesteps
+    the problem class entirely: run the ffmpeg subprocess with its
+    working directory (cwd) set to the folder containing the .srt
+    file, and reference it by bare filename only — no colon, no
+    backslash, nothing for the filter parser to mis-tokenize.
+
+    input_path and output_path are NOT affected by this issue (they
+    go as ordinary -i / output arguments, not embedded inside a
+    filter string), so they stay as absolute paths as normal.
+    """
     srt_dir = os.path.dirname(srt_path)
     srt_filename = os.path.basename(srt_path)
 
@@ -98,6 +169,11 @@ def _burn_subtitles(input_path: str, srt_path: str, output_path: str) -> None:
 
 
 def run_assembler(state: PipelineState, logger) -> PipelineState:
+    """
+    Node entrypoint. Called by main.py's LangGraph graph.
+    Reads state["beats"] (each with audio_path, audio_duration,
+    image_path), writes state["final_video_path"].
+    """
     beats = state.get("beats", [])
     total = len(beats)
 
@@ -107,19 +183,16 @@ def run_assembler(state: PipelineState, logger) -> PipelineState:
         console_message="Assembler  → rendering final video...",
     )
 
-    run_id = state.get("run_id") or f"unlabeled_{uuid.uuid4().hex[:8]}"
-    if "run_id" not in state:
-        log_event(
-            logger, node="Assembler", status="RETRY", beat="-",
-            message=f"state['run_id'] missing — using fallback {run_id}. Check main.py init.",
-            console_message="⚠ Assembler: run_id missing, check main.py",
-        )
+    # run_id is guaranteed present by main.py's assertion before the
+    # graph starts -- no fallback needed here.
+    run_id = state["run_id"]
 
     work_dir = os.path.join(config.CHECKPOINTS_DIR, run_id, "assembler")
     os.makedirs(work_dir, exist_ok=True)
 
     clip_paths = []
     try:
+        # Step 1: render each beat into its own Ken Burns + audio clip
         for i, beat in enumerate(beats):
             beat_label = f"{i + 1}/{total}"
             clip_path = os.path.join(work_dir, f"clip_{beat['index']}.mp4")
@@ -143,6 +216,7 @@ def run_assembler(state: PipelineState, logger) -> PipelineState:
                 message=f"Clip saved to {clip_path}",
             )
 
+        # Step 2: concatenate all beat clips into one video
         list_path = os.path.join(work_dir, "concat_list.txt")
         concatenated_path = os.path.join(work_dir, "concatenated.mp4")
         _write_concat_file(clip_paths, list_path)
@@ -153,6 +227,7 @@ def run_assembler(state: PipelineState, logger) -> PipelineState:
             message=f"Concatenated {total} clips into {concatenated_path}",
         )
 
+        # Step 3: generate subtitles and burn them into the final video
         srt_path = os.path.join(work_dir, "subtitles.srt")
         _write_srt(beats, srt_path)
 
@@ -172,4 +247,10 @@ def run_assembler(state: PipelineState, logger) -> PipelineState:
         message=f"Final render complete: {final_path}",
         console_message="Assembler  → done — check data/output folder",
     )
+
+    # Return only the changed key — see node_director.py for the full
+    # explanation. Assembler is the last node (no parallel step after
+    # it), so this isn't strictly required for correctness here, but
+    # keeping it consistent with every other node avoids reintroducing
+    # this bug if the graph is ever restructured later.
     return {"final_video_path": final_path}

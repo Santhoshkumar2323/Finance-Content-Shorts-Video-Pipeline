@@ -1,7 +1,29 @@
+"""
+nodes/node_visuals.py
+
+LangGraph Node 4: Visuals.
+
+Calls Pollinations.ai's image generation API to produce ONE SQUARE
+(1024x1024) image per beat. Square only -- NOT vertical -- to avoid
+face/subject distortion some models show at extreme aspect ratios.
+The vertical crop happens later, in Node 5 (FFmpeg), from this
+square source image.
+
+Explicitly requests model=flux (config.POLLINATIONS_MODEL) rather
+than relying on Pollinations' implicit default -- flux is their
+free, unlimited, best-quality option.
+
+Console output is a single live-updating "N/total" line (via
+utils.logger_setup.live_progress) instead of one line per beat --
+per-beat detail still goes to the file log via log_event().
+
+Runs in parallel with node_audio.py (Node 3) -- this node does not
+depend on Node 3's output, and vice versa.
+"""
+
 import os
 import io
 import urllib.parse
-import uuid
 
 import requests
 from PIL import Image
@@ -18,6 +40,8 @@ from utils.logger_setup import log_event, live_progress
 
 
 class VisualGenerationError(Exception):
+    """Raised when an image cannot be generated for a beat,
+    even after all retries are exhausted."""
     pass
 
 
@@ -32,6 +56,14 @@ class VisualGenerationError(Exception):
     reraise=True,
 )
 def _call_pollinations_api(prompt: str) -> bytes:
+    """
+    Makes the actual Pollinations.ai API call. Isolated so Tenacity's
+    retry decorator wraps ONLY the network call.
+
+    No API key, no auth header -- Pollinations' image endpoint is
+    unauthenticated. The prompt goes directly in the URL path, so it
+    must be percent-encoded.
+    """
     encoded_prompt = urllib.parse.quote(prompt, safe="")
     url = f"{config.POLLINATIONS_IMAGE_URL}/{encoded_prompt}"
 
@@ -41,18 +73,25 @@ def _call_pollinations_api(prompt: str) -> bytes:
             "width": config.IMAGE_WIDTH,
             "height": config.IMAGE_HEIGHT,
             "model": config.POLLINATIONS_MODEL,
-            "nologo": "true",  
+            "nologo": "true",  # suppress Pollinations' watermark
         },
-        timeout=60,  
+        timeout=60,  # generation can take longer than typical API calls
     )
-    response.raise_for_status()  
-    return response.content 
+    response.raise_for_status()  # raises HTTPError on 4xx/5xx -> triggers retry
+    return response.content  # raw image bytes
 
 
 def _generate_beat_image(prompt: str, output_path: str) -> None:
+    """
+    Generates one square image for a beat's image_prompt and
+    saves it to output_path as a PNG.
+    """
     image_bytes = _call_pollinations_api(prompt)
+
     image = Image.open(io.BytesIO(image_bytes))
 
+    # Defensive check: confirm we actually got a square image at
+    # the expected size, not a differently-shaped fallback response.
     if image.size != (config.IMAGE_WIDTH, config.IMAGE_HEIGHT):
         image = image.resize((config.IMAGE_WIDTH, config.IMAGE_HEIGHT))
 
@@ -60,6 +99,11 @@ def _generate_beat_image(prompt: str, output_path: str) -> None:
 
 
 def run_visuals(state: PipelineState, logger) -> PipelineState:
+    """
+    Node entrypoint. Called by main.py's LangGraph graph.
+    Reads state["beats"][i]["image_prompt"], writes
+    state["beats"][i]["image_path"] for every beat.
+    """
     beats = state.get("beats", [])
     total = len(beats)
 
@@ -69,12 +113,9 @@ def run_visuals(state: PipelineState, logger) -> PipelineState:
     )
     live_progress("Visuals", 0, total)
 
-    run_id = state.get("run_id") or f"unlabeled_{uuid.uuid4().hex[:8]}"
-    if "run_id" not in state:
-        log_event(
-            logger, node="Visuals", status="RETRY", beat="-",
-            message=f"state['run_id'] missing -- using fallback {run_id}. Check main.py init.",
-        )
+    # run_id is guaranteed present by main.py's assertion before the
+    # graph starts -- no fallback needed here.
+    run_id = state["run_id"]
 
     image_dir = os.path.join(config.CHECKPOINTS_DIR, run_id, "images")
     os.makedirs(image_dir, exist_ok=True)
@@ -113,4 +154,9 @@ def run_visuals(state: PipelineState, logger) -> PipelineState:
         message=f"All {total} beat images generated",
     )
     live_progress("Visuals", total, total, done=True)
+
+    # Return only the changed key -- see node_director.py for why
+    # returning the whole state breaks the parallel Audio/Visuals step.
+    # merge_beats (state.py) combines this branch's image_path fields
+    # with Audio's audio fields by beat index.
     return {"beats": beats}
